@@ -234,16 +234,23 @@ put_file(Bucket, Key, FileName, ContentType, Metadata) ->
 %% Retrieves the data associated with the given key.
 %% 
 %% Spec: get_object(Bucket::string(), Key::string()) ->
-%%       {ok, Data::binary()} |
+%%       {ok, Data::binary(), ContentType::string(), {requestId, RequestId}} |
 %%       {error, {Code::string(), Msg::string(), ReqId::string()}}
 %%
 get_object(Bucket, Key) ->
     try genericRequest(get, Bucket, Key, [], [], [], <<>>) of
 	{ok, Headers, Body} -> 
-		RequestId = case lists:keytake(?S3_REQ_ID_HEADER, 1, Headers) of
-			{value, {_, ReqId}, _} -> ReqId;
+
+		RequestId = case lists:keysearch(?S3_REQ_ID_HEADER, 1, Headers) of
+			{value, {_, ReqId}} -> ReqId;
 			_ -> "" end,
-		{ok, Body, {requestId, RequestId}}
+
+        ContentType = case lists:keysearch("content-type", 1, Headers) of
+            {value, {_, V}} -> V;
+            _ -> "" end,
+
+		{ok, Body, ContentType, {requestId, RequestId}}
+
     catch
 	throw:{error, Descr} ->
 	    {error, Descr}
@@ -258,7 +265,6 @@ get_object(Bucket, Key) ->
 info_object(Bucket, Key) ->
     try genericRequest(head, Bucket, Key, [], [], [], <<>>) of
 	{ok, Headers, _Body} ->
-	    io:format("Headers: ~p~n", [Headers]),
 		MetadataList = [{string:substr(MKey, 12), Value} || {MKey, Value} <- Headers, string:str(MKey, "x-amz-meta") == 1],
 		RequestId = case lists:keytake(?S3_REQ_ID_HEADER, 1, Headers) of
 			{value, {_, ReqId}, _} -> ReqId;

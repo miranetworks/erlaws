@@ -16,7 +16,7 @@ SDB = erlaws_sdb:new(AWS_KEY, AWS_SEC_KEY, (true|false)).
 
 The last parameter determines whether the connection should made using plain HTTP (false) or HTTPS (true).
 
-In order to be able to use erlaws the "inets" and "crypto" application must be started.
+In order to be able to use erlaws the "inets", "crypto" and "ssl" applications must be started.
 
 = Documentation =
 
