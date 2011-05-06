@@ -10,7 +10,7 @@
 
 %% API
 -export([list_buckets/0, create_bucket/1, create_bucket/2, delete_bucket/1]).
--export([list_contents/1, list_contents/2, put_object/5, put_file/5, get_object/2]).
+-export([list_contents/1, list_contents/2, put_object/5, put_file/5, get_object/2, get_file/3]).
 -export([info_object/2, delete_object/2]).
 
 %% include record definitions
@@ -224,12 +224,24 @@ put_file(Bucket, Key, FileName, ContentType, Metadata) ->
            lists:flatten([lists:append([K, ": ", V, "\n"]) || 
                              {K, V} <- lists:reverse(FinalHeaders)]),
            "\n"]),
-    {ok, Socket} = gen_tcp:connect(?AWS_S3_HOST, 80, 
-                                   [binary, {active, false}, {packet, 0}]),
-    gen_tcp:send(Socket, list_to_binary(Payload)),
-    sendData(Socket, File),
-    gen_tcp:close(Socket),
-    file:close(File).
+
+    {ok, Socket} = 
+    if SECURE ->
+
+        ssl:connect(?AWS_S3_HOST, 443, [binary, {active, false}, {packet, 0}]);
+
+    true ->
+        gen_tcp:connect(?AWS_S3_HOST, 80, [binary, {active, false}, {packet, 0}])
+
+    end,
+
+    ok = if SECURE -> ssl:send(Socket, list_to_binary(Payload)); true ->  gen_tcp:send(Socket, list_to_binary(Payload)) end,
+
+    ok = sendData(Socket, File),
+
+    ok = if SECURE -> ok = ssl:close(Socket); true ->  gen_tcp:close(Socket) end,
+
+    ok = file:close(File).
        
 %% Retrieves the data associated with the given key.
 %% 
@@ -255,7 +267,31 @@ get_object(Bucket, Key) ->
 	throw:{error, Descr} ->
 	    {error, Descr}
     end.
-    
+
+%% Retrieves the data associated with the given key, and stream it to a file ...
+%% 
+%% Spec: get_file(Bucket::string(), Key::string()) ->
+%%       {ok, Data::binary(), ContentType::string(), {requestId, RequestId}} |
+%%       {error, {Code::string(), Msg::string(), ReqId::string()}}
+%%
+get_file(Bucket, Key, TgtFilename) ->
+
+    TmpFilename = TgtFilename ++ ".part", 
+
+    file:delete(TmpFilename),
+
+    try genericRequest({get, TmpFilename}, Bucket, Key, [], [], [], <<>>) of
+	{ok, saved_to_file} ->
+
+        ok = file:rename(TmpFilename, TgtFilename),
+
+		ok
+
+    catch
+	throw:{error, Descr} ->
+	    {error, Descr}
+    end.
+     
 %% Returns the metadata associated with the given key.
 %%
 %% Spec: info_object(Bucket::string(), Key::string()) ->
@@ -394,7 +430,17 @@ genericRequest( Method, Bucket, Path, QueryParams, Metadata,
 genericRequest( Method, Bucket, Path, QueryParams, Metadata, 
 		HTTPHeaders, Body, NrOfRetries) ->
     Date = httpd_util:rfc1123_date(erlang:localtime()),
-    MethodString = string:to_upper( atom_to_list(Method) ),
+
+    RMethod = 
+    case Method of
+    {get, _} ->
+        get;
+
+    _ ->
+        Method
+    end,
+
+    MethodString = string:to_upper( atom_to_list(RMethod) ),
     Url = buildUrl(Bucket,Path,QueryParams),
 
     ContentMD5 = case Body of
@@ -427,46 +473,59 @@ genericRequest( Method, Bucket, Path, QueryParams, Metadata,
 
     Request = case Method of
  		  get -> { Url, FinalHeaders };
+ 		  {get, _} -> { Url, FinalHeaders };
 		  head -> { Url, FinalHeaders };
  		  put -> { Url, FinalHeaders, ContentType, Body };
  		  delete -> { Url, FinalHeaders }
  	      end,
 
     HttpOptions = [{autoredirect, true}],
-    Options = [ {sync,true}, {headers_as_is,true}, {body_format, binary} ],
 
-    Reply = http:request( Method, Request, HttpOptions, Options ),
+
+    Options = 
+    case Method of
+    {get, Filename} ->
+        [ {sync, true}, {headers_as_is,true}, {body_format, binary}, {stream, Filename} ];
+
+    _ ->
+        [ {sync,true}, {headers_as_is,true}, {body_format, binary} ]
+    end,
+
+    Reply = http:request( RMethod, Request, HttpOptions, Options ),
     
     %%     {ok, {Status, ReplyHeaders, RBody}} = Reply,
     %%     io:format("Response:~n ~p~n~p~n~p~n", [Status, ReplyHeaders, 
     %% 					   binary_to_list(RBody)]),
     
-    case Reply of
- 	{ok, {{_HttpVersion, Code, _ReasonPhrase}, ResponseHeaders, 
-	      ResponseBody }} when Code=:=200; Code=:=204 -> 
- 	    {ok, ResponseHeaders, ResponseBody};
 
-	{ok, {{_HttpVersion, Code, ReasonPhrase}, ResponseHeaders, 
-	      _ResponseBody }} when Code=:=500, NrOfRetries == 0 ->
-	    throw ({error, {"500", ReasonPhrase, 
-		    proplists:get_value(?S3_REQ_ID_HEADER, ResponseHeaders)}});
-	
-	{ok, {{_HttpVersion, Code, _ReasonPhrase}, _ResponseHeaders, 
-	      _ResponseBody }} when Code=:=500 ->
-	    timer:sleep((?NR_OF_RETRIES-NrOfRetries)*500),
-	    genericRequest(Method, Bucket, Path, QueryParams, 
-			   Metadata, HTTPHeaders, Body, NrOfRetries-1);
-	
- 	{ok, {{_HttpVersion, HttpCode, ReasonPhrase}, ResponseHeaders, 
-	      ResponseBody }} ->
-	    throw (try mkErr(ResponseBody, ResponseHeaders) of
-		      {error, Reason} -> {error, Reason}
-		  catch
-		      exit:_Error ->
-			  {error, {integer_to_list(HttpCode), ReasonPhrase, 
-			   proplists:get_value(?S3_REQ_ID_HEADER, ResponseHeaders)}}
-		  end)
-    end.
+    case Reply of
+    {ok, saved_to_file} ->
+        {ok, saved_to_file};
+  	{ok, {{_HttpVersion, Code, _ReasonPhrase}, ResponseHeaders, 
+ 	      ResponseBody }} when Code=:=200; Code=:=204 -> 
+  	    {ok, ResponseHeaders, ResponseBody};
+
+ 	{ok, {{_HttpVersion, Code, ReasonPhrase}, ResponseHeaders, 
+ 	      _ResponseBody }} when Code=:=500, NrOfRetries == 0 ->
+ 	    throw ({error, {"500", ReasonPhrase, 
+ 		    proplists:get_value(?S3_REQ_ID_HEADER, ResponseHeaders)}});
+ 	
+ 	{ok, {{_HttpVersion, Code, _ReasonPhrase}, _ResponseHeaders, 
+ 	      _ResponseBody }} when Code=:=500 ->
+ 	    timer:sleep((?NR_OF_RETRIES-NrOfRetries)*500),
+ 	    genericRequest(Method, Bucket, Path, QueryParams, 
+ 			   Metadata, HTTPHeaders, Body, NrOfRetries-1);
+ 	
+  	{ok, {{_HttpVersion, HttpCode, ReasonPhrase}, ResponseHeaders, 
+ 	      ResponseBody }} ->
+ 	    throw (try mkErr(ResponseBody, ResponseHeaders) of
+ 		      {error, Reason} -> {error, Reason}
+ 		  catch
+ 		      exit:_Error ->
+ 			  {error, {integer_to_list(HttpCode), ReasonPhrase, 
+ 			   proplists:get_value(?S3_REQ_ID_HEADER, ResponseHeaders)}}
+ 		  end)
+     end.
 
 mkErr (Xml, Headers) ->
     {XmlDoc, _Rest} = xmerl_scan:string( binary_to_list(Xml) ),
@@ -497,7 +556,9 @@ openAndGetFileSize(FileName) ->
 sendData(Socket, File) ->
     case file:read(File, ?CHUNK_SIZE) of
         {ok, Data} ->
-            gen_tcp:send(Socket, Data),
+
+            ok = if SECURE -> ssl:send(Socket, Data); true ->  gen_tcp:send(Socket, Data) end,
+
             sendData(Socket, File);
         eof ->
             ok
